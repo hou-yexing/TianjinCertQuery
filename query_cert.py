@@ -7,7 +7,7 @@ import re
 import sys
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - user-facing dependency check
 
 
 TARGET_URL = "https://zfcxjs.tj.gov.cn/ggfw_70/xxcx/agryxx/"
+BUILDER_URL = "https://zfcxjs.tj.gov.cn/ggfw_70/xxcx/zyryxx/"
 OUTPUT_DIR = Path("output")
 SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
 DEBUG_DIR = OUTPUT_DIR / "debug"
@@ -56,11 +57,38 @@ DETAIL_LABELS = (
     "有效期至",
 )
 
+BUILDER_LABEL_ALIASES = {
+    "name": ("姓名",),
+    "gender": ("性别",),
+    "register_category": ("注册类别",),
+    "id_no": ("证件编号", "身份证号", "证书编号"),
+    "seal_no": ("执业印章号",),
+    "valid_from": ("注册证书有效期开始", "有效期开始", "注册有效期开始"),
+    "valid_to": ("注册证书有效期结束", "有效期结束", "注册有效期结束", "有效期至"),
+    "major": ("注册专业",),
+    "company": ("注册证书所在单位名称", "注册单位", "聘用企业", "企业名称", "单位名称"),
+}
+
+BUILDER_EXPORT_HEADERS = [
+    "姓名",
+    "性别",
+    "注册类别",
+    "证件编号",
+    "执业印章号",
+    "注册证书有效期开始",
+    "注册证书有效期结束",
+    "注册专业",
+    "注册证书所在单位名称",
+    "查询时间",
+]
+
 
 @dataclass(frozen=True)
 class CompanyTask:
     company: str
     targets: dict[str, int]
+    required_names: dict[str, list[str]] = field(default_factory=dict)
+    builder_names: list[str] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,6 +260,27 @@ def fill_company(page, company: str) -> None:
             except Exception:
                 continue
     raise RuntimeError("没有找到公司名称输入框，请检查页面是否已正常打开。")
+
+
+def fill_person_name(page, name: str) -> None:
+    selectors = (
+        'input[placeholder*="姓名"]',
+        'input[aria-label*="姓名"]',
+        'input[type="text"]',
+        "input:not([type])",
+    )
+    for frame in candidate_frames(page):
+        for selector in selectors:
+            locator = frame.locator(selector).first
+            try:
+                if locator.count() and locator.is_visible(timeout=1500):
+                    locator.fill(name, timeout=3000)
+                    return
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+    raise RuntimeError("没有找到姓名输入框，请检查页面是否已正常打开。")
 
 
 def submit_query(page) -> bool:
@@ -698,13 +747,15 @@ def click_detail_for_records(page, records: list[dict[str, str]], log=print) -> 
     first = records[0]
     raw = first.get("_source_raw") or first.get("raw", "")
     name = first.get("_source_name") or first.get("name", "")
+    company = first.get("company", "")
     row_index = first.get("_source_row_index", "")
     row_key = first.get("_source_row_key", "")
     cert_numbers = [item.get("cert_no", "") for item in records if item.get("cert_no")]
     script = """
-        ({ raw, name, certNumbers, rowIndex, rowKey }) => {
+        ({ raw, name, company, certNumbers, rowKey }) => {
           const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
           const certKey = (s) => clean(s).replace(/[（）]/g, (m) => m === '（' ? '(' : ')').replace(/\\s+/g, '').toUpperCase();
+          const companyKey = clean(company);
           const visible = (el) => {
             const box = el.getBoundingClientRect();
             const style = getComputedStyle(el);
@@ -717,21 +768,18 @@ def click_detail_for_records(page, records: list[dict[str, str]], log=print) -> 
           for (const scroller of scrollers) scroller.scrollLeft = scroller.scrollWidth;
 
           const targetCertKeys = certNumbers.map(certKey).filter(Boolean);
-          let targetY = null;
-          let matchedCert = '';
-          const textNodes = [...document.querySelectorAll('td,span,div')].filter(visible);
-          for (const node of textNodes) {
-            const text = certKey(node.innerText || node.textContent || '');
-            const cert = targetCertKeys.find((item) => item && text.includes(item));
-            if (!cert) continue;
-            const row = node.closest('tr');
-            const box = (row || node).getBoundingClientRect();
-            targetY = box.top + box.height / 2;
-            matchedCert = cert;
-            break;
-          }
           const detailLinks = [...document.querySelectorAll('a,button,span,[role="button"],.ant-btn')]
             .filter((el) => visible(el) && /详情|查看/.test(clean(el.innerText || el.value || el.title || '')));
+          const rowMatchesTarget = (row) => {
+            const text = clean(row.innerText);
+            if (!text) return false;
+            if (companyKey && !text.includes(companyKey)) return false;
+            const hasName = name && text.includes(name);
+            const normalized = certKey(text);
+            const hasCert = targetCertKeys.some((cert) => cert && normalized.includes(cert));
+            if (raw && text === raw) return true;
+            return Boolean(hasName || hasCert);
+          };
           const pointFor = (el, method) => {
             el.scrollIntoView({ block: 'center', inline: 'center' });
             const box = el.getBoundingClientRect();
@@ -746,6 +794,7 @@ def click_detail_for_records(page, records: list[dict[str, str]], log=print) -> 
           if (rowKey) {
             const keyedRows = [...document.querySelectorAll(`tr[data-row-key="${CSS.escape(rowKey)}"]`)].filter(visible);
             for (const keyedRow of keyedRows) {
+              if (!rowMatchesTarget(keyedRow)) continue;
               const detail = [...keyedRow.querySelectorAll('a,button,span,[role="button"],.ant-btn')]
                 .filter(visible)
                 .find((el) => /详情|查看/.test(clean(el.innerText || el.value || el.title || '')));
@@ -753,34 +802,12 @@ def click_detail_for_records(page, records: list[dict[str, str]], log=print) -> 
             }
             const keyedDetail = detailLinks.find((el) => {
               const tr = el.closest('tr');
-              return tr && tr.getAttribute('data-row-key') === rowKey;
+              return tr && tr.getAttribute('data-row-key') === rowKey && rowMatchesTarget(tr);
             });
             if (keyedDetail) return pointFor(keyedDetail, `row-key-link:${rowKey}`);
           }
-          if (targetY !== null && detailLinks.length) {
-            let best = null;
-            for (const link of detailLinks) {
-              const box = link.getBoundingClientRect();
-              const y = box.top + box.height / 2;
-              const distance = Math.abs(y - targetY);
-              if (!best || distance < best.distance) best = { link, distance };
-            }
-            if (best && best.distance <= 90) {
-              return pointFor(best.link, `y-match:${matchedCert}`);
-            }
-          }
-          const numericIndex = Number(rowIndex);
-          if (Number.isInteger(numericIndex) && numericIndex >= 0 && detailLinks[numericIndex]) {
-            return pointFor(detailLinks[numericIndex], `row-index:${numericIndex}`);
-          }
           const rows = [...document.querySelectorAll('tr')].filter(visible);
-          const target = rows.find((row) => {
-            const text = clean(row.innerText);
-            if (!text) return false;
-            if (raw && text === raw) return true;
-            if (name && !text.includes(name)) return false;
-            return certNumbers.some((cert) => cert && text.includes(cert));
-          });
+          const target = rows.find(rowMatchesTarget);
           if (!target) return false;
           const controls = [...target.querySelectorAll('button,a,span,[role="button"],.ant-btn')].filter(visible);
           const detail = controls.find((el) => /详情|查看/.test(clean(el.innerText || el.value || el.title || '')));
@@ -788,7 +815,7 @@ def click_detail_for_records(page, records: list[dict[str, str]], log=print) -> 
           return pointFor(detail, 'same-row');
         }
         """
-    payload = {"raw": raw, "name": name, "certNumbers": cert_numbers, "rowIndex": row_index, "rowKey": row_key}
+    payload = {"raw": raw, "name": name, "company": company, "certNumbers": cert_numbers, "rowKey": row_key}
     for frame in candidate_frames(page):
         try:
             result = frame.evaluate(script, payload)
@@ -886,6 +913,392 @@ def close_detail(page) -> bool:
         return True
     except Exception:
         return False
+
+
+def wait_for_builder_results(page, name: str, log=print, timeout_seconds: int = 60) -> bool:
+    deadline = time.time() + timeout_seconds
+    last_log = 0.0
+    stable_hits = 0
+    last_signature = ""
+    while time.time() < deadline:
+        rows = extract_visible_tables(page)
+        matches = [
+            row
+            for row in rows
+            if name in normalize_text(row.get("raw", "")) and "建造师" in normalize_text(row.get("raw", ""))
+        ]
+        state = page_loading_state(page)
+        signature = "\n".join(normalize_text(row.get("raw", "")) for row in matches)
+        if matches and signature == last_signature and not state["loading"]:
+            stable_hits += 1
+        elif matches:
+            stable_hits = 1
+            last_signature = signature
+        else:
+            stable_hits = 0
+            last_signature = ""
+        if matches and stable_hits >= 3:
+            log(f"建造师查询结果已稳定：{name}，发现 {len(matches)} 条候选记录。")
+            return True
+        now = time.time()
+        if now - last_log >= 5:
+            log(f"正在等待建造师查询结果加载：{name}")
+            last_log = now
+        page.wait_for_timeout(1000)
+    log(f"等待 {name} 的建造师查询结果超时。")
+    return False
+
+
+def click_builder_detail(page, name: str, log=print) -> bool:
+    script = """
+        ({ name }) => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const visible = (el) => {
+            const box = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const scrollers = [...document.querySelectorAll('*')].filter((el) => {
+            const box = el.getBoundingClientRect();
+            return box.width > 0 && box.height > 0 && el.scrollWidth > el.clientWidth + 20;
+          });
+          for (const scroller of scrollers) scroller.scrollLeft = scroller.scrollWidth;
+          const rows = [...document.querySelectorAll('tr')].filter(visible);
+          const target = rows.find((row) => {
+            const text = clean(row.innerText);
+            return text.includes(name) && text.includes('建造师');
+          });
+          if (!target) return null;
+          const controls = [...target.querySelectorAll('button,a,span,[role="button"],.ant-btn')].filter(visible);
+          const detail = controls.find((el) => /详情|查看/.test(clean(el.innerText || el.value || el.title || '')));
+          if (!detail) return null;
+          detail.scrollIntoView({ block: 'center', inline: 'center' });
+          const box = detail.getBoundingClientRect();
+          return { x: box.left + box.width / 2, y: box.top + box.height / 2, row: clean(target.innerText) };
+        }
+        """
+    for frame in candidate_frames(page):
+        try:
+            result = frame.evaluate(script, {"name": name})
+            if not result:
+                continue
+            x = float(result["x"])
+            y = float(result["y"])
+            if frame != page.main_frame:
+                frame_box = frame.frame_element().bounding_box()
+                if frame_box:
+                    x += float(frame_box["x"])
+                    y += float(frame_box["y"])
+            before_url = page.url
+            before_text = visible_page_text(page)
+            page.mouse.click(x, y)
+            log(f"已点击建造师详情：{name}")
+            if wait_for_builder_detail_page(page, before_url, before_text, timeout_seconds=12):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_for_builder_detail_page(page, before_url: str, before_text: str, timeout_seconds: int = 12) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        text = visible_page_text(page)
+        if page.url != before_url and ("执业印章号" in text or "注册专业" in text):
+            return True
+        if "返回" in text and ("执业印章号" in text or "注册专业" in text or text != before_text):
+            return True
+        page.wait_for_timeout(500)
+    return False
+
+
+def extract_visible_label_fields(page, aliases: dict[str, tuple[str, ...]]) -> dict[str, str]:
+    labels = [label for values in aliases.values() for label in values]
+    script = """
+        ({ labels }) => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const hiddenByAncestor = (el) => {
+            for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+              const ariaHidden = node.getAttribute && node.getAttribute('aria-hidden');
+              const cls = String(node.className || '');
+              if (ariaHidden === 'true' || /ant-tabs-tabpane-inactive/.test(cls)) return true;
+            }
+            return false;
+          };
+          const visible = (el) => {
+            if (!el || hiddenByAncestor(el)) return false;
+            const box = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const wanted = new Set(labels);
+          const fields = {};
+          for (const row of [...document.querySelectorAll('tr')]) {
+            if (!visible(row)) continue;
+            const cells = [...row.querySelectorAll('th,td')].map((cell) => clean(cell.innerText));
+            for (let i = 0; i < cells.length - 1; i++) {
+              const key = cells[i].replace(/[：:]/g, '');
+              if (wanted.has(key) && cells[i + 1]) fields[key] = cells[i + 1];
+            }
+          }
+          return fields;
+        }
+        """
+    raw: dict[str, str] = {}
+    for frame in candidate_frames(page):
+        try:
+            values = frame.evaluate(script, {"labels": labels})
+            for key, value in values.items():
+                if normalize_text(value):
+                    raw[normalize_text(key)] = normalize_text(value)
+        except Exception:
+            continue
+    mapped: dict[str, str] = {}
+    for field, field_aliases in aliases.items():
+        for alias in field_aliases:
+            if alias in raw:
+                mapped[field] = raw[alias]
+                break
+    return mapped
+
+
+def extract_builder_license_rows(page) -> list[dict[str, str]]:
+    script = """
+        () => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const visible = (el) => {
+            const box = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const rows = [];
+          for (const tr of [...document.querySelectorAll('tbody tr')]) {
+            if (!visible(tr)) continue;
+            const cells = [...tr.querySelectorAll('td,th')].map((cell) => clean(cell.innerText));
+            if (cells.length < 7) continue;
+            const text = cells.join(' ');
+            if (!text.includes('建造师')) continue;
+            rows.push({
+              category: cells[1] || '',
+              id_no: cells[2] || '',
+              seal_no: cells[3] || '',
+              valid_from: cells[5] || '',
+              valid_to: cells[6] || '',
+              major: cells[7] || '',
+              raw: text
+            });
+          }
+          return rows;
+        }
+        """
+    result: list[dict[str, str]] = []
+    for frame in candidate_frames(page):
+        try:
+            rows = frame.evaluate(script)
+            for row in rows:
+                result.append({key: normalize_text(value) for key, value in row.items()})
+        except Exception:
+            continue
+    return result
+
+
+def builder_detail_loading_state(page) -> dict[str, object]:
+    script = """
+        () => {
+          const clean = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const visible = (el) => {
+            const box = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const loading = [...document.querySelectorAll('.ant-spin-spinning,.ant-spin-dot-spin,.ant-spin-dot')]
+            .some(visible);
+          const rows = [...document.querySelectorAll('tbody tr')]
+            .filter(visible)
+            .map((tr) => clean(tr.innerText))
+            .filter((text) => text && !/暂无数据|No Data/.test(text));
+          return {
+            loading,
+            rowCount: rows.length,
+            builderRows: rows.filter((text) => text.includes('建造师')).length,
+            hasNoData: /暂无数据|No Data/.test(document.body ? document.body.innerText : '')
+          };
+        }
+        """
+    states: list[dict[str, object]] = []
+    for frame in candidate_frames(page):
+        try:
+            states.append(frame.evaluate(script))
+        except Exception:
+            continue
+    return {
+        "loading": any(bool(item.get("loading")) for item in states),
+        "row_count": sum(int(item.get("rowCount") or 0) for item in states),
+        "builder_rows": sum(int(item.get("builderRows") or 0) for item in states),
+        "has_no_data": any(bool(item.get("hasNoData")) for item in states),
+    }
+
+
+def wait_for_builder_detail_rows(page, name: str, log=print, timeout_seconds: int = 90) -> bool:
+    deadline = time.time() + timeout_seconds
+    last_log = 0.0
+    stable_hits = 0
+    last_count = -1
+    while time.time() < deadline:
+        state = builder_detail_loading_state(page)
+        builder_rows = int(state.get("builder_rows") or 0)
+        if builder_rows > 0 and not state.get("loading"):
+            if builder_rows == last_count:
+                stable_hits += 1
+            else:
+                stable_hits = 1
+                last_count = builder_rows
+            if stable_hits >= 2:
+                log(f"{name} 的建造师注册明细已加载，发现 {builder_rows} 条建造师记录。")
+                return True
+        else:
+            stable_hits = 0
+            last_count = builder_rows
+        now = time.time()
+        if now - last_log >= 5:
+            if state.get("loading"):
+                log(f"正在等待 {name} 的建造师注册明细加载...")
+            elif state.get("has_no_data"):
+                log(f"{name} 的建造师明细表暂显示暂无数据，继续等待刷新...")
+            else:
+                log(f"正在等待 {name} 的建造师明细行出现...")
+            last_log = now
+        page.wait_for_timeout(1000)
+    log(f"等待 {name} 的建造师注册明细超时。")
+    return False
+
+
+def extract_builder_detail_records(page, company: str, name: str, log=print) -> list[dict[str, str]]:
+    top_fields = extract_visible_label_fields(page, BUILDER_LABEL_ALIASES)
+    detail_company = normalize_text(top_fields.get("company", ""))
+    detail_name = normalize_text(top_fields.get("name", "")) or normalize_text(name)
+    if detail_name and normalize_text(name) and detail_name != normalize_text(name):
+        log(f"跳过建造师详情：当前详情姓名为“{detail_name}”，不是“{name}”。")
+        return []
+    if detail_company and normalize_text(company) not in detail_company and detail_company not in normalize_text(company):
+        log(f"跳过建造师详情：{detail_name} 的注册单位为“{detail_company}”，与查询单位不一致。")
+        return []
+
+    rows = extract_visible_tables(page)
+    records: list[dict[str, str]] = []
+    for row in rows:
+        cells = [normalize_text(cell) for cell in row.get("__cells", [])]
+        category = normalize_text(row.get("注册类别", "")) or (cells[1] if len(cells) > 1 else "")
+        if "建造师" not in category:
+            continue
+        id_no = normalize_text(row.get("证件编号", "")) or (cells[2] if len(cells) > 2 else "")
+        seal_no = normalize_text(row.get("执业印章号", "")) or (cells[3] if len(cells) > 3 else "")
+        valid_from = normalize_text(row.get("注册证书有效期开始", "")) or (cells[5] if len(cells) > 5 else "")
+        valid_to = normalize_text(row.get("注册证书有效期结束", "")) or (cells[6] if len(cells) > 6 else "")
+        major = normalize_text(row.get("注册专业", "")) or (cells[7] if len(cells) > 7 else "")
+        record = {
+            "name": detail_name,
+            "gender": top_fields.get("gender", ""),
+            "register_category": category,
+            "id_no": id_no,
+            "seal_no": seal_no,
+            "valid_from": normalize_date(valid_from),
+            "valid_to": normalize_date(valid_to),
+            "major": major,
+            "company": detail_company,
+        }
+        records.append(record)
+
+    if not records:
+        for row in extract_builder_license_rows(page):
+            category = normalize_text(row.get("category", ""))
+            if "建造师" not in category:
+                continue
+            records.append(
+                {
+                    "name": detail_name,
+                    "gender": top_fields.get("gender", ""),
+                    "register_category": category,
+                    "id_no": row.get("id_no", ""),
+                    "seal_no": row.get("seal_no", ""),
+                    "valid_from": normalize_date(row.get("valid_from", "")),
+                    "valid_to": normalize_date(row.get("valid_to", "")),
+                    "major": row.get("major", ""),
+                    "company": detail_company,
+                }
+            )
+
+    if not records:
+        # Some page variants may expose the builder record as a two-column detail table.
+        category = normalize_text(top_fields.get("register_category", ""))
+        if "建造师" in category:
+            records.append(
+                {
+                    "name": detail_name,
+                    "gender": top_fields.get("gender", ""),
+                    "register_category": category,
+                    "id_no": top_fields.get("id_no", ""),
+                    "seal_no": top_fields.get("seal_no", ""),
+                    "valid_from": normalize_date(top_fields.get("valid_from", "")),
+                    "valid_to": normalize_date(top_fields.get("valid_to", "")),
+                    "major": top_fields.get("major", ""),
+                    "company": detail_company,
+                }
+            )
+    return records
+
+
+def collect_builder_for_name(page, company: str, name: str, wait_for_user=None, log=print) -> list[dict[str, str]]:
+    name = normalize_text(name)
+    if not name:
+        return []
+    log(f"\n正在查询建造师：{name}")
+    page.goto(BUILDER_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(3000)
+    fill_person_name(page, name)
+    if submit_query(page):
+        log(f"已提交建造师姓名查询：{name}")
+    else:
+        log("未能自动识别建造师查询按钮，请手动点击查询。")
+    if not wait_for_builder_results(page, name, log=log, timeout_seconds=25):
+        log("如果建造师页面需要滑块验证或仍在加载，请手动完成验证并等待结果行出现后继续。")
+        if wait_for_user:
+            wait_for_user()
+        if not wait_for_builder_results(page, name, log=log, timeout_seconds=70):
+            return []
+    if not click_builder_detail(page, name, log=log):
+        log(f"未找到 {name} 的建造师详情入口。")
+        return []
+    if not wait_for_builder_detail_rows(page, name, log=log, timeout_seconds=90):
+        debug_html = save_debug_html(page, f"建造师_{name}")
+        log(f"{name} 的建造师详情明细未加载完成，已保存调试页面：{debug_html}")
+        close_detail(page)
+        return []
+    records = extract_builder_detail_records(page, company, name, log=log)
+    if records:
+        for record in records:
+            log(f"已采集建造师：{record['name']} / {record['register_category']} / {record['valid_to']}")
+        close_detail(page)
+        return records
+    debug_html = save_debug_html(page, f"建造师_{name}")
+    log(f"{name} 的详情页已加载，但未解析出单位一致的建造师注册明细，已保存调试页面：{debug_html}")
+    close_detail(page)
+    return []
+
+
+def collect_builders(page, company: str, names: list[str], wait_for_user=None, log=print) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    for name in names:
+        name = normalize_text(name)
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        try:
+            records.extend(collect_builder_for_name(page, company, name, wait_for_user=wait_for_user, log=log))
+        except Exception as exc:
+            log(f"建造师 {name} 查询失败：{exc}")
+    return records
 
 
 def click_detail_cert_tab(page, record: dict[str, str], log=print) -> bool:
@@ -1175,7 +1588,7 @@ def collect_company(page, task: CompanyTask, max_pages: int, wait_for_user=None,
             break
         if signature:
             seen_pages.add(signature)
-        page_needed = select_remaining_targets(page_records, records, task.targets)
+        page_needed = select_remaining_targets(page_records, records, task.targets, task.required_names)
         if page_needed:
             log(f"本页选中 {len(page_needed)} 条证书，逐条进入详情补充有效期。")
             try:
@@ -1189,7 +1602,7 @@ def collect_company(page, task: CompanyTask, max_pages: int, wait_for_user=None,
             log_counts(records, task.targets, log=log)
         else:
             log("本页没有符合剩余 A/B/C 数量要求的证书。")
-        if enough_records(records, task.targets):
+        if enough_records(records, task.targets, task.required_names):
             break
         if not ensure_company_results(page, task.company, page_no=page_no, log=log):
             break
@@ -1203,15 +1616,59 @@ def collect_company(page, task: CompanyTask, max_pages: int, wait_for_user=None,
     if not records:
         debug_html = save_debug_html(page, task.company)
         log(f"未识别到数据，已保存调试页面：{debug_html}")
+    for level in ("A", "B", "C"):
+        for required_name in names_for_level(task, level):
+            if not selected_has_name(records, level, required_name):
+                log(f"提示：指定 {level}证姓名“{required_name}”未在已采集结果中找到。")
     return dedupe_records(records), screenshot
 
 
-def select_remaining_targets(page_records: list[dict[str, str]], selected_records: list[dict[str, str]], targets: dict[str, int]) -> list[dict[str, str]]:
+def names_for_level(task: CompanyTask, level: str) -> list[str]:
+    return [
+        normalize_text(name)
+        for name in task.required_names.get(level, [])
+        if normalize_text(name)
+    ]
+
+
+def selected_has_name(records: list[dict[str, str]], level: str, name: str) -> bool:
+    return any(
+        normalize_text(item.get("level", "")).upper().startswith(level)
+        and normalize_text(item.get("name", "")) == normalize_text(name)
+        for item in records
+    )
+
+
+def record_key(record: dict[str, str]) -> tuple[str, str, str]:
+    return (record.get("company", ""), record.get("name", ""), record.get("cert_no", ""))
+
+
+def select_remaining_targets(
+    page_records: list[dict[str, str]],
+    selected_records: list[dict[str, str]],
+    targets: dict[str, int],
+    required_names: dict[str, list[str]] | None = None,
+) -> list[dict[str, str]]:
     selected: list[dict[str, str]] = []
+    required_names = required_names or {}
+    seen = {record_key(item) for item in selected_records}
     for level in ("A", "B", "C"):
         target = targets.get(level, 0)
         if target <= 0:
             continue
+        level_records = [
+            item
+            for item in page_records
+            if normalize_text(item.get("level", "")).upper().startswith(level)
+        ]
+        for required_name in required_names.get(level, []):
+            if selected_has_name(selected_records + selected, level, required_name):
+                continue
+            for item in level_records:
+                if normalize_text(item.get("name", "")) == normalize_text(required_name) and record_key(item) not in seen:
+                    selected.append(item)
+                    seen.add(record_key(item))
+                    break
         current = sum(
             1
             for item in selected_records + selected
@@ -1220,22 +1677,28 @@ def select_remaining_targets(page_records: list[dict[str, str]], selected_record
         remaining = target - current
         if remaining <= 0:
             continue
-        level_records = [
-            item
-            for item in page_records
-            if normalize_text(item.get("level", "")).upper().startswith(level)
-        ]
-        selected.extend(level_records[:remaining])
+        for item in level_records:
+            if record_key(item) in seen:
+                continue
+            selected.append(item)
+            seen.add(record_key(item))
+            remaining -= 1
+            if remaining <= 0:
+                break
     return selected
 
 
-def enough_records(records: list[dict[str, str]], targets: dict[str, int]) -> bool:
+def enough_records(records: list[dict[str, str]], targets: dict[str, int], required_names: dict[str, list[str]] | None = None) -> bool:
+    required_names = required_names or {}
     for level, target in targets.items():
         if target <= 0:
             continue
         count = sum(1 for item in records if normalize_text(item.get("level", "")).upper().startswith(level))
         if count < target:
             return False
+        for required_name in required_names.get(level, []):
+            if required_name and not selected_has_name(records, level, required_name):
+                return False
     return True
 
 
@@ -1263,14 +1726,32 @@ def dedupe_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
     return unique
 
 
-def select_targets(records: list[dict[str, str]], targets: dict[str, int]) -> list[dict[str, str]]:
+def select_targets(records: list[dict[str, str]], targets: dict[str, int], required_names: dict[str, list[str]] | None = None) -> list[dict[str, str]]:
     selected: list[dict[str, str]] = []
+    required_names = required_names or {}
+    seen: set[tuple[str, str, str]] = set()
     for level in ("A", "B", "C"):
         target = targets.get(level, 0)
         if target <= 0:
             continue
         level_records = [item for item in records if normalize_text(item.get("level", "")).upper().startswith(level)]
-        selected.extend(level_records[:target])
+        for required_name in required_names.get(level, []):
+            for item in level_records:
+                if normalize_text(item.get("name", "")) == normalize_text(required_name) and record_key(item) not in seen:
+                    selected.append(item)
+                    seen.add(record_key(item))
+                    break
+        remaining = target - sum(1 for item in selected if normalize_text(item.get("level", "")).upper().startswith(level))
+        if remaining <= 0:
+            continue
+        for item in level_records:
+            if record_key(item) in seen:
+                continue
+            selected.append(item)
+            seen.add(record_key(item))
+            remaining -= 1
+            if remaining <= 0:
+                break
     return selected
 
 
@@ -1283,7 +1764,7 @@ def default_output_path(tasks: list[CompanyTask]) -> Path:
     return OUTPUT_DIR / f"{name}_{timestamp}.xlsx"
 
 
-def export_results(records: list[dict[str, str]], output: Path) -> None:
+def export_results(records: list[dict[str, str]], output: Path, builder_records: list[dict[str, str]] | None = None) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     headers = ["公司名称", "证书类别", "姓名", "证书编号", "有效期至", "查询时间", "页面截图", "原始行"]
     rows = [
@@ -1299,9 +1780,31 @@ def export_results(records: list[dict[str, str]], output: Path) -> None:
         }
         for item in records
     ]
+    builder_records = builder_records or []
+    builder_rows = [
+        {
+            "姓名": item.get("name", ""),
+            "性别": item.get("gender", ""),
+            "注册类别": item.get("register_category", ""),
+            "证件编号": item.get("id_no", ""),
+            "执业印章号": item.get("seal_no", ""),
+            "注册证书有效期开始": item.get("valid_from", ""),
+            "注册证书有效期结束": item.get("valid_to", ""),
+            "注册专业": item.get("major", ""),
+            "注册证书所在单位名称": item.get("company", ""),
+            "查询时间": item.get("queried_at", ""),
+        }
+        for item in builder_records
+    ]
 
     if output.suffix.lower() == ".xlsx":
-        write_xlsx(output, headers, rows)
+        write_xlsx_multi(
+            output,
+            [
+                ("安管人员证书", headers, rows, (24, 10, 12, 30, 16, 20, 50, 80)),
+                ("建造师信息", BUILDER_EXPORT_HEADERS, builder_rows, (14, 8, 18, 24, 24, 18, 18, 24, 32, 20)),
+            ],
+        )
         print(f"已导出 Excel：{output}")
         return
 
@@ -1317,6 +1820,10 @@ def write_csv(output: Path, headers: list[str], rows: list[dict[str, str]]) -> N
 
 
 def write_xlsx(output: Path, headers: list[str], rows: list[dict[str, str]]) -> None:
+    write_xlsx_multi(output, [("安管人员证书", headers, rows, (24, 10, 12, 30, 16, 20, 50, 80))])
+
+
+def sheet_xml(headers: list[str], rows: list[dict[str, str]], widths: tuple[int, ...]) -> str:
     sheet_rows = [headers] + [[row.get(header, "") for header in headers] for row in rows]
     sheet_xml_rows = []
     for row_idx, values in enumerate(sheet_rows, start=1):
@@ -1331,9 +1838,9 @@ def write_xlsx(output: Path, headers: list[str], rows: list[dict[str, str]]) -> 
 
     cols = "".join(
         f'<col min="{idx}" max="{idx}" width="{width}" customWidth="1"/>'
-        for idx, width in enumerate((24, 10, 12, 30, 16, 20, 50, 80), start=1)
+        for idx, width in enumerate(widths, start=1)
     )
-    worksheet = (
+    return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
@@ -1341,11 +1848,19 @@ def write_xlsx(output: Path, headers: list[str], rows: list[dict[str, str]]) -> 
         f"<sheetData>{''.join(sheet_xml_rows)}</sheetData>"
         "</worksheet>"
     )
+
+
+def write_xlsx_multi(output: Path, sheets: list[tuple[str, list[str], list[dict[str, str]], tuple[int, ...]]]) -> None:
+    worksheets = [sheet_xml(headers, rows, widths) for _, headers, rows, widths in sheets]
+    sheet_entries = "".join(
+        f'<sheet name="{escape(name)}" sheetId="{idx}" r:id="rId{idx}"/>'
+        for idx, (name, _, _, _) in enumerate(sheets, start=1)
+    )
     workbook = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="安管人员证书" sheetId="1" r:id="rId1"/></sheets>'
+        f"<sheets>{sheet_entries}</sheets>"
         "</workbook>"
     )
     styles = (
@@ -1366,7 +1881,11 @@ def write_xlsx(output: Path, headers: list[str], rows: list[dict[str, str]]) -> 
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for idx in range(1, len(sheets) + 1)
+        )
+        +
         '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
         "</Types>"
     )
@@ -1379,8 +1898,11 @@ def write_xlsx(output: Path, headers: list[str], rows: list[dict[str, str]]) -> 
     workbook_rels = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        + "".join(
+            f'<Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{idx}.xml"/>'
+            for idx in range(1, len(sheets) + 1)
+        )
+        + f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
         "</Relationships>"
     )
 
@@ -1390,7 +1912,8 @@ def write_xlsx(output: Path, headers: list[str], rows: list[dict[str, str]]) -> 
         archive.writestr("xl/workbook.xml", workbook)
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         archive.writestr("xl/styles.xml", styles)
-        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+        for idx, worksheet in enumerate(worksheets, start=1):
+            archive.writestr(f"xl/worksheets/sheet{idx}.xml", worksheet)
 
 
 def column_name(index: int) -> str:
@@ -1432,7 +1955,7 @@ def main() -> int:
         try:
             for task in tasks:
                 records, screenshot = collect_company(page, task, args.max_pages)
-                selected = select_targets(records, task.targets)
+                selected = select_targets(records, task.targets, task.required_names)
                 if not selected and records:
                     print("提示：按 A/B/C 数量筛选结果为空，已改为导出本次识别到的全部列表记录。")
                     selected = records
