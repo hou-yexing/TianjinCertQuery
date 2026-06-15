@@ -1,0 +1,10 @@
+.deps/
+.playwright-browsers/
+build/
+dist/
+output/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+*.log
