@@ -4,9 +4,10 @@ import os
 import queue
 import sys
 import threading
+import ctypes
 from datetime import datetime
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, filedialog, messagebox, ttk
+from tkinter import BOTH, END, X, filedialog, messagebox, ttk
 import tkinter as tk
 
 import query_cert
@@ -19,8 +20,7 @@ class QueryCertApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("天津证书查询工具")
-        self.geometry("1180x780")
-        self.minsize(1080, 700)
+        self._configure_window()
 
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
         self.continue_event = threading.Event()
@@ -31,6 +31,36 @@ class QueryCertApp(tk.Tk):
         self._configure_style()
         self._build_ui()
         self.after(150, self._poll_messages)
+
+    def _configure_window(self) -> None:
+        work_x, work_y, work_width, work_height = self._get_work_area()
+        min_width = min(960, max(760, work_width - 80))
+        min_height = min(620, max(540, work_height - 80))
+        width = min(1680, max(min_width, int(work_width * 0.85)))
+        height = min(900, max(min_height, int(work_height * 0.85)))
+        if work_width <= 1400 or work_height <= 820:
+            width = min(work_width, max(min_width, work_width - 16))
+            height = min(work_height, max(min_height, work_height - 16))
+        left = work_x + max(0, (work_width - width) // 2)
+        top = work_y + max(0, (work_height - height) // 2)
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self.minsize(min_width, min_height)
+
+    def _get_work_area(self) -> tuple[int, int, int, int]:
+        if sys.platform == "win32":
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            rect = RECT()
+            spi_getworkarea = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(spi_getworkarea, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
 
     def _configure_style(self) -> None:
         self.configure(bg="#eef4fb")
@@ -50,16 +80,30 @@ class QueryCertApp(tk.Tk):
         style.configure("CardTitle.TLabel", background="#fbfdff", foreground="#12315f", font=self.section_font)
         style.configure("TLabel", background="#fbfdff", foreground="#31405a")
         style.configure("TEntry", padding=(8, 6))
-        style.configure("TSpinbox", padding=(8, 6))
         style.configure("Primary.TButton", background="#2563eb", foreground="#ffffff", padding=(16, 8), font=("Microsoft YaHei UI", 11, "bold"))
         style.map("Primary.TButton", background=[("active", "#0891b2"), ("disabled", "#9fb3cf")])
         style.configure("Tool.TButton", padding=(12, 7))
-        style.configure("Treeview", rowheight=30, font=("Microsoft YaHei UI", 10))
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Step.TButton", padding=(10, 7), font=("Microsoft YaHei UI", 12, "bold"))
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, style="App.TFrame")
-        outer.pack(fill=BOTH, expand=True, padx=22, pady=(18, 26))
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        shell = ttk.Frame(self, style="App.TFrame")
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(0, weight=1)
+
+        self.scroll_canvas = tk.Canvas(shell, bg="#eef4fb", highlightthickness=0)
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        self.scroll_bar = ttk.Scrollbar(shell, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=self._sync_scrollbar)
+
+        outer = ttk.Frame(self.scroll_canvas, style="App.TFrame", padding=(18, 14, 18, 14))
+        self.content_window = self.scroll_canvas.create_window((0, 0), window=outer, anchor="n")
+        self.scroll_canvas.bind("<Configure>", self._resize_scroll_content)
+        outer.bind("<Configure>", lambda _event: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")))
+        self.scroll_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
         ttk.Label(outer, text="天津证书查询工具", style="Title.TLabel").pack(anchor="w")
         ttk.Label(outer, text="安管人员证书与建造师信息采集，支持指定姓名优先匹配。", style="Muted.TLabel").pack(anchor="w", pady=(4, 14))
@@ -77,12 +121,14 @@ class QueryCertApp(tk.Tk):
         ttk.Button(top, text="选择", style="Tool.TButton", command=self.choose_output).grid(row=1, column=2, sticky="ew", padx=(12, 0))
         ttk.Button(top, text="打开目录", style="Tool.TButton", command=self.open_output_dir).grid(row=1, column=3, sticky="ew", padx=(8, 0))
         self.start_button = ttk.Button(top, text="开始查询", style="Primary.TButton", command=self.start_query)
-        self.start_button.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(12, 0), pady=(0, 30))
+        self.start_button.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(12, 0), pady=(0, 16))
 
         middle = ttk.Frame(outer, style="App.TFrame")
-        middle.pack(fill=X, pady=(16, 0))
-        middle.columnconfigure(0, weight=3)
-        middle.columnconfigure(1, weight=2)
+        middle.pack(fill=BOTH, expand=True, pady=(16, 0))
+        middle.columnconfigure(0, weight=5)
+        middle.columnconfigure(1, weight=6)
+        middle.rowconfigure(0, weight=3)
+        middle.rowconfigure(1, weight=1)
 
         cert_card = self._card(middle)
         cert_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
@@ -93,7 +139,7 @@ class QueryCertApp(tk.Tk):
         for row, level in enumerate(("A", "B", "C"), start=1):
             self.count_vars[level] = tk.IntVar(value=0)
             self.name_vars[level] = [tk.StringVar(), tk.StringVar()]
-            self._field(cert_card, f"{level}证数量", self.count_vars[level], row=row, column=0, width=10, spin=True)
+            self._number_field(cert_card, f"{level}证数量", self.count_vars[level], row=row, column=0)
             self._field(cert_card, f"{level}证姓名1", self.name_vars[level][0], row=row, column=1)
             self._field(cert_card, f"{level}证姓名2", self.name_vars[level][1], row=row, column=2)
         for idx in range(3):
@@ -105,12 +151,6 @@ class QueryCertApp(tk.Tk):
         self.builder_vars = [tk.StringVar(), tk.StringVar()]
         self._field(builder_card, "建造师姓名1", self.builder_vars[0], row=1, column=0)
         self._field(builder_card, "建造师姓名2", self.builder_vars[1], row=1, column=1)
-        ttk.Label(
-            builder_card,
-            text="按姓名查询注册类别包含“建造师”的记录，详情页单位一致后写入“建造师信息”。",
-            style="TLabel",
-            wraplength=360,
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(18, 0))
         builder_card.columnconfigure(0, weight=1)
         builder_card.columnconfigure(1, weight=1)
 
@@ -119,11 +159,14 @@ class QueryCertApp(tk.Tk):
         self.status_var = tk.StringVar(value="就绪")
         self.last_log_var = tk.StringVar(value="等待开始查询")
         self._section_title(status_card, "工作状态").pack(anchor="w", pady=(0, 12))
-        status_text_area = ttk.Frame(status_card, style="Card.TFrame", height=118)
+        status_text_area = ttk.Frame(status_card, style="Card.TFrame", height=80)
         status_text_area.pack(fill=X, pady=(0, 12))
         status_text_area.pack_propagate(False)
-        ttk.Label(status_text_area, textvariable=self.status_var, style="CardTitle.TLabel", wraplength=360).pack(anchor="w", fill=X)
-        ttk.Label(status_text_area, textvariable=self.last_log_var, style="TLabel", wraplength=360).pack(anchor="w", fill=X, pady=(8, 0))
+        self.status_label = ttk.Label(status_text_area, textvariable=self.status_var, style="CardTitle.TLabel", wraplength=360)
+        self.status_label.pack(anchor="w", fill=X)
+        self.last_log_label = ttk.Label(status_text_area, textvariable=self.last_log_var, style="TLabel", wraplength=360)
+        self.last_log_label.pack(anchor="w", fill=X, pady=(8, 0))
+        status_card.bind("<Configure>", self._resize_status_wrap)
         self.continue_button = ttk.Button(
             status_card,
             text="已看到结果行，继续采集",
@@ -136,7 +179,7 @@ class QueryCertApp(tk.Tk):
         ttk.Label(status_card, text="运行日志", style="CardTitle.TLabel").pack(anchor="w", pady=(0, 8))
         self.log_text = tk.Text(
             status_card,
-            height=14,
+            height=7,
             wrap="word",
             bg="#0f172a",
             fg="#dbeafe",
@@ -148,40 +191,79 @@ class QueryCertApp(tk.Tk):
         )
         self.log_text.pack(fill=BOTH, expand=True)
 
-        columns = ("sheet", "level", "name", "cert_no", "expires_at", "company")
-        self.table = ttk.Treeview(outer, columns=columns, show="headings", height=9)
-        headings = {
-            "sheet": "表单",
-            "level": "类别",
-            "name": "姓名",
-            "cert_no": "证书/证件编号",
-            "expires_at": "有效期",
-            "company": "单位名称",
-        }
-        widths = {"sheet": 130, "level": 110, "name": 100, "cert_no": 260, "expires_at": 170, "company": 280}
-        for column in columns:
-            self.table.heading(column, text=headings[column])
-            self.table.column(column, width=widths[column], anchor="w")
-        self.table.pack(fill=BOTH, expand=True, pady=(14, 0))
-
         self.company_var.trace_add("write", lambda *_: self._refresh_default_output())
         self.company_entry.focus()
 
+    def _resize_scroll_content(self, event: tk.Event) -> None:
+        width = min(max(event.width - 2, 760), 1680)
+        x = max(0, (event.width - width) // 2)
+        requested_height = self.scroll_canvas.nametowidget(self.scroll_canvas.itemcget(self.content_window, "window")).winfo_reqheight()
+        height = max(event.height, requested_height)
+        self.scroll_canvas.coords(self.content_window, x, 0)
+        self.scroll_canvas.itemconfigure(self.content_window, width=width, height=height)
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def _sync_scrollbar(self, first: str, last: str) -> None:
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.scroll_bar.grid_remove()
+        else:
+            self.scroll_bar.grid(row=0, column=1, sticky="ns")
+        self.scroll_bar.set(first, last)
+
+    def _resize_status_wrap(self, event: tk.Event) -> None:
+        wraplength = max(260, event.width - 44)
+        self.status_label.configure(wraplength=wraplength)
+        self.last_log_label.configure(wraplength=wraplength)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        if self.scroll_canvas.bbox("all"):
+            self.scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
     def _card(self, parent) -> ttk.Frame:
-        frame = ttk.Frame(parent, style="Card.TFrame", padding=18)
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=14)
         return frame
 
     def _section_title(self, parent, text: str) -> ttk.Label:
         return ttk.Label(parent, text=text, style="CardTitle.TLabel")
 
-    def _field(self, parent, label: str, variable, row: int, column: int, width: int | None = None, spin: bool = False) -> None:
+    def _number_field(self, parent, label: str, variable: tk.IntVar, row: int, column: int) -> None:
         wrap = ttk.Frame(parent, style="Card.TFrame")
         wrap.grid(row=row, column=column, sticky="ew", padx=(0 if column == 0 else 12, 0), pady=(0, 12))
         ttk.Label(wrap, text=label).pack(anchor="w", pady=(0, 6))
-        if spin:
-            widget = ttk.Spinbox(wrap, textvariable=variable, from_=0, to=999, width=width or 12)
-        else:
-            widget = ttk.Entry(wrap, textvariable=variable, width=width)
+
+        controls = ttk.Frame(wrap, style="Card.TFrame")
+        controls.pack(fill=X)
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            controls,
+            text="-",
+            width=3,
+            style="Step.TButton",
+            command=lambda var=variable: self._adjust_count(var, -1),
+        ).grid(row=0, column=0, sticky="ns")
+        entry = ttk.Entry(controls, textvariable=variable, width=5, justify="center")
+        entry.grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(
+            controls,
+            text="+",
+            width=3,
+            style="Step.TButton",
+            command=lambda var=variable: self._adjust_count(var, 1),
+        ).grid(row=0, column=2, sticky="ns")
+
+    def _adjust_count(self, variable: tk.IntVar, delta: int) -> None:
+        try:
+            current = int(variable.get())
+        except Exception:
+            current = 0
+        variable.set(max(0, current + delta))
+
+    def _field(self, parent, label: str, variable, row: int, column: int, width: int | None = None) -> None:
+        wrap = ttk.Frame(parent, style="Card.TFrame")
+        wrap.grid(row=row, column=column, sticky="ew", padx=(0 if column == 0 else 12, 0), pady=(0, 12))
+        ttk.Label(wrap, text=label).pack(anchor="w", pady=(0, 6))
+        widget = ttk.Entry(wrap, textvariable=variable, width=width)
         widget.pack(fill=X)
         if label == "单位名称":
             self.company_entry = widget
@@ -235,10 +317,10 @@ class QueryCertApp(tk.Tk):
             messagebox.showwarning("缺少查询条件", "请至少设置一种证书数量，或填写建造师姓名。")
             return
 
-        self.table.delete(*self.table.get_children())
         self.continue_event.clear()
         self.start_button.config(state="disabled")
         self.status_var.set("正在打开浏览器...")
+        self.last_log_var.set("正在打开浏览器...")
         task = query_cert.CompanyTask(company=company, targets=targets, required_names=required_names, builder_names=builder_names)
         if not self.output_chosen:
             self.output_path.set(str(self.default_output_path(company)))
@@ -343,32 +425,9 @@ class QueryCertApp(tk.Tk):
 
     def _show_results(self, payload: object) -> None:
         data = payload if isinstance(payload, dict) else {"certs": payload, "builders": []}
-        for item in data.get("certs", []):
-            self.table.insert(
-                "",
-                END,
-                values=(
-                    "安管人员证书",
-                    item.get("level", ""),
-                    item.get("name", ""),
-                    item.get("cert_no", ""),
-                    item.get("expires_at", ""),
-                    item.get("company", ""),
-                ),
-            )
-        for item in data.get("builders", []):
-            self.table.insert(
-                "",
-                END,
-                values=(
-                    "建造师信息",
-                    item.get("register_category", ""),
-                    item.get("name", ""),
-                    item.get("id_no", ""),
-                    f"{item.get('valid_from', '')} - {item.get('valid_to', '')}".strip(" -"),
-                    item.get("company", ""),
-                ),
-            )
+        certs = data.get("certs", [])
+        builders = data.get("builders", [])
+        self._append_log(f"结果预览：安管人员证书 {len(certs)} 条，建造师信息 {len(builders)} 条。")
 
 
 def main() -> None:

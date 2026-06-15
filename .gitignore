@@ -8,3 +8,7 @@ __pycache__/
 *.pyo
 *.spec
 *.log
+TianjinCertQuery-main.zip
+github_download/
+_github_sync/
+ui_mockups.html
